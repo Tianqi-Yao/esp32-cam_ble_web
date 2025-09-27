@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32-CAM BLE 图像传输</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+            color: #333;
+        }
+        
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #2c3e50 0%, #3498db 100%);
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+        
+        .status-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: #34495e;
+            padding: 10px 20px;
+            color: white;
+        }
+        
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #e74c3c;
+            margin-right: 10px;
+        }
+        
+        .status-dot.connected {
+            background: #2ecc71;
+        }
+        
+        .control-panel {
+            padding: 20px;
+            background: #f8f9fa;
+            border-bottom: 1px solid #e9ecef;
+        }
+        
+        .button-group {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-bottom: 15px;
+        }
+        
+        button {
+            padding: 12px 20px;
+            border: none;
+            border-radius: 8px;
+            background: #3498db;
+            color: white;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.3s;
+            flex: 1;
+            min-width: 120px;
+        }
+        
+        button:hover {
+            background: #2980b9;
+            transform: translateY(-2px);
+        }
+        
+        button:disabled {
+            background: #bdc3c7;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        button.primary {
+            background: #e74c3c;
+        }
+        
+        button.primary:hover {
+            background: #c0392b;
+        }
+        
+        .resolution-buttons {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+            gap: 10px;
+            margin-top: 10px;
+        }
+        
+        .image-container {
+            padding: 20px;
+            text-align: center;
+            min-height: 400px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        #imageDisplay {
+            max-width: 100%;
+            max-height: 400px;
+            border: 3px solid #e9ecef;
+            border-radius: 10px;
+            display: none;
+        }
+        
+        .placeholder {
+            color: #7f8c8d;
+            font-size: 16px;
+        }
+        
+        .progress-bar {
+            width: 100%;
+            height: 6px;
+            background: #ecf0f1;
+            border-radius: 3px;
+            margin: 10px 0;
+            overflow: hidden;
+            display: none;
+        }
+        
+        .progress {
+            height: 100%;
+            background: linear-gradient(90deg, #3498db, #2ecc71);
+            width: 0%;
+            transition: width 0.3s;
+        }
+        
+        .info-panel {
+            padding: 15px;
+            background: #f8f9fa;
+            border-top: 1px solid #e9ecef;
+            font-size: 14px;
+            color: #7f8c8d;
+        }
+        
+        .log {
+            background: #2c3e50;
+            color: white;
+            padding: 15px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            max-height: 150px;
+            overflow-y: auto;
+            border-radius: 0 0 15px 15px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>ESP32-CAM BLE 图像传输</h1>
+            <p>通过蓝牙低功耗传输摄像头图像</p>
+        </div>
+        
+        <div class="status-bar">
+            <div class="status-info">
+                <span class="status-dot" id="statusDot"></span>
+                <span id="statusText">未连接</span>
+            </div>
+            <div class="device-info" id="deviceInfo"></div>
+        </div>
+        
+        <div class="control-panel">
+            <div class="button-group">
+                <button id="connectBtn" class="primary">连接设备</button>
+                <button id="disconnectBtn" disabled>断开连接</button>
+                <button id="captureBtn" disabled>拍摄图片</button>
+            </div>
+            
+            <div class="resolution-buttons">
+                <button data-resolution="0">VGA (640x480)</button>
+                <button data-resolution="1">SVGA (800x600)</button>
+                <button data-resolution="2">XGA (1024x768)</button>
+                <button data-resolution="3">SXGA (1280x1024)</button>
+                <button data-resolution="4">UXGA (1600x1200)</button>
+            </div>
+        </div>
+        
+        <div class="image-container">
+            <div class="progress-bar" id="progressBar">
+                <div class="progress" id="progress"></div>
+            </div>
+            <img id="imageDisplay" alt="摄像头图像">
+            <div class="placeholder" id="placeholder">图像将显示在这里</div>
+        </div>
+        
+        <div class="info-panel">
+            <div>图像信息: <span id="imageInfo">等待数据...</span></div>
+        </div>
+        
+        <div class="log" id="log"></div>
+    </div>
+
+    <script>
+        // BLE UUIDs
+        const SERVICE_UUID = '19b10000-e8f2-537e-4f6c-d104768a1214';
+        const IMAGE_CHAR_UUID = '19b10001-e8f2-537e-4f6c-d104768a1214';
+        const CONTROL_CHAR_UUID = '19b10002-e8f2-537e-4f6c-d104768a1214';
+
+        // 全局变量
+        let device = null;
+        let server = null;
+        let service = null;
+        let imageChar = null;
+        let controlChar = null;
+        let isConnected = false;
+        let imageData = null;
+        let expectedSize = 0;
+        let receivedSize = 0;
+
+        // DOM 元素
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const deviceInfo = document.getElementById('deviceInfo');
+        const connectBtn = document.getElementById('connectBtn');
+        const disconnectBtn = document.getElementById('disconnectBtn');
+        const captureBtn = document.getElementById('captureBtn');
+        const imageDisplay = document.getElementById('imageDisplay');
+        const placeholder = document.getElementById('placeholder');
+        const progressBar = document.getElementById('progressBar');
+        const progress = document.getElementById('progress');
+        const imageInfo = document.getElementById('imageInfo');
+        const log = document.getElementById('log');
+
+        // 日志函数
+        function addLog(message) {
+            const timestamp = new Date().toLocaleTimeString();
+            log.innerHTML += `[${timestamp}] ${message}\n`;
+            log.scrollTop = log.scrollHeight;
+        }
+
+        // 更新连接状态
+        function updateConnectionStatus(connected) {
+            isConnected = connected;
+            statusDot.className = 'status-dot' + (connected ? ' connected' : '');
+            statusText.textContent = connected ? '已连接' : '未连接';
+            connectBtn.disabled = connected;
+            disconnectBtn.disabled = !connected;
+            captureBtn.disabled = !connected;
+        }
+
+        // 连接设备
+        connectBtn.addEventListener('click', async () => {
+            try {
+                if (!navigator.bluetooth) {
+                    alert('您的浏览器不支持Web Bluetooth');
+                    return;
+                }
+
+                addLog('正在搜索ESP32-CAM设备...');
+                
+                device = await navigator.bluetooth.requestDevice({
+                    filters: [{ name: 'ESP32-CAM-BLE' }],
+                    optionalServices: [SERVICE_UUID]
+                });
+
+                device.addEventListener('gattserverdisconnected', onDisconnected);
+                
+                addLog(`找到设备: ${device.name}`);
+                deviceInfo.textContent = device.name || '未知设备';
+
+                addLog('正在连接...');
+                server = await device.gatt.connect();
+                service = await server.getPrimaryService(SERVICE_UUID);
+                
+                // 获取特征
+                imageChar = await service.getCharacteristic(IMAGE_CHAR_UUID);
+                controlChar = await service.getCharacteristic(CONTROL_CHAR_UUID);
+                
+                // 监听图像数据
+                await imageChar.startNotifications();
+                imageChar.addEventListener('characteristicvaluechanged', handleImageData);
+                
+                updateConnectionStatus(true);
+                addLog('连接成功！');
+
+            } catch (error) {
+                addLog('连接失败: ' + error);
+                console.error('Connection error:', error);
+            }
+        });
+
+        // 断开连接
+        disconnectBtn.addEventListener('click', () => {
+            if (server) {
+                server.disconnect();
+            }
+        });
+
+        // 断开连接处理
+        function onDisconnected() {
+            updateConnectionStatus(false);
+            deviceInfo.textContent = '';
+            addLog('设备已断开连接');
+        }
+
+        // 拍摄图片
+        captureBtn.addEventListener('click', async () => {
+            if (!controlChar) return;
+            
+            try {
+                addLog('发送拍摄命令...');
+                const command = new TextEncoder().encode('C');
+                await controlChar.writeValue(command);
+                addLog('拍摄命令已发送');
+            } catch (error) {
+                addLog('拍摄失败: ' + error);
+            }
+        });
+
+        // 分辨率设置
+        document.querySelectorAll('.resolution-buttons button').forEach(button => {
+            button.addEventListener('click', async () => {
+                if (!controlChar || !isConnected) return;
+                
+                const resolution = button.getAttribute('data-resolution');
+                try {
+                    addLog(`设置分辨率: ${resolution}`);
+                    const command = new TextEncoder().encode(resolution);
+                    await controlChar.writeValue(command);
+                    addLog('分辨率设置命令已发送');
+                } catch (error) {
+                    addLog('分辨率设置失败: ' + error);
+                }
+            });
+        });
+
+        // 处理接收到的图像数据
+        function handleImageData(event) {
+            const value = event.target.value;
+            
+            if (value.byteLength === 0) return;
+
+            // 检查是否是文本命令（SIZE: 或 END）
+            if (value.byteLength < 20) { // 假设文本命令较短
+                const text = new TextDecoder().decode(value);
+                
+                if (text.startsWith('SIZE:')) {
+                    // 开始新图像传输
+                    expectedSize = parseInt(text.substring(5));
+                    receivedSize = 0;
+                    imageData = new Uint8Array(expectedSize);
+                    progressBar.style.display = 'block';
+                    progress.style.width = '0%';
+                    addLog(`开始接收图像，大小: ${expectedSize} 字节`);
+                    return;
+                } else if (text === 'END') {
+                    // 图像传输完成
+                    if (imageData && receivedSize === expectedSize) {
+                        displayImage(imageData);
+                        addLog(`图像接收完成: ${receivedSize} 字节`);
+                    }
+                    progressBar.style.display = 'none';
+                    imageData = null;
+                    return;
+                }
+            }
+
+            // 处理图像数据块
+            if (imageData && receivedSize < expectedSize) {
+                const chunk = new Uint8Array(value.buffer);
+                const remaining = expectedSize - receivedSize;
+                const chunkSize = Math.min(remaining, chunk.length);
+                
+                imageData.set(chunk.subarray(0, chunkSize), receivedSize);
+                receivedSize += chunkSize;
+                
+                // 更新进度条
+                const progressPercent = (receivedSize / expectedSize) * 100;
+                progress.style.width = progressPercent + '%';
+                
+                if (receivedSize % 5120 === 0) { // 每5KB记录一次
+                    addLog(`已接收: ${receivedSize}/${expectedSize} 字节 (${progressPercent.toFixed(1)}%)`);
+                }
+            }
+        }
+
+        // 显示图像
+        function displayImage(data) {
+            try {
+                const blob = new Blob([data], { type: 'image/jpeg' });
+                const url = URL.createObjectURL(blob);
+                imageDisplay.src = url;
+                imageDisplay.style.display = 'block';
+                placeholder.style.display = 'none';
+                
+                imageInfo.textContent = `大小: ${data.length} 字节, 分辨率: 根据设置`;
+                addLog('图像显示成功');
+            } catch (error) {
+                addLog('图像显示失败: ' + error);
+            }
+        }
+
+        // 初始化
+        addLog('页面加载完成，点击"连接设备"开始');
+    </script>
+</body>
+</html>
