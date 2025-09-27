@@ -215,23 +215,24 @@
     </div>
 
     <script>
-        // BLE UUIDs
         const SERVICE_UUID = '19b10000-e8f2-537e-4f6c-d104768a1214';
         const IMAGE_CHAR_UUID = '19b10001-e8f2-537e-4f6c-d104768a1214';
         const CONTROL_CHAR_UUID = '19b10002-e8f2-537e-4f6c-d104768a1214';
-
-        // 全局变量
-        let device = null;
-        let server = null;
-        let service = null;
-        let imageChar = null;
-        let controlChar = null;
+        
+        let device, server, service, imageChar, controlChar;
         let isConnected = false;
-        let imageData = null;
+        
         let expectedSize = 0;
         let receivedSize = 0;
-
-        // DOM 元素
+        let totalSegs = 0;
+        let expectSeq = 0;
+        let transferId = 0;
+        let imageBuffer = null;
+        let receiving = false;
+        let lastProgressTs = 0;
+        let timeoutTimer = null;
+        
+        // DOM
         const statusDot = document.getElementById('statusDot');
         const statusText = document.getElementById('statusText');
         const deviceInfo = document.getElementById('deviceInfo');
@@ -244,178 +245,237 @@
         const progress = document.getElementById('progress');
         const imageInfo = document.getElementById('imageInfo');
         const log = document.getElementById('log');
-
-        // 日志函数
-        function addLog(message) {
-            const timestamp = new Date().toLocaleTimeString();
-            log.innerHTML += `[${timestamp}] ${message}\n`;
-            log.scrollTop = log.scrollHeight;
+        
+        function addLog(m){
+          const t = new Date().toLocaleTimeString();
+          log.textContent += `[${t}] ${m}\n`;
+          log.scrollTop = log.scrollHeight;
         }
-
-        // 更新连接状态
-        function updateConnectionStatus(connected) {
-            isConnected = connected;
-            statusDot.className = 'status-dot' + (connected ? ' connected' : '');
-            statusText.textContent = connected ? '已连接' : '未连接';
-            connectBtn.disabled = connected;
-            disconnectBtn.disabled = !connected;
-            captureBtn.disabled = !connected;
+        function setConn(b){
+          isConnected = b;
+          statusDot.className = 'status-dot' + (b ? ' connected' : '');
+          statusText.textContent = b ? '已连接' : '未连接';
+          connectBtn.disabled = b;
+          disconnectBtn.disabled = !b;
+          captureBtn.disabled = !b;
         }
-
-        // 连接设备
-        connectBtn.addEventListener('click', async () => {
-            try {
-                if (!navigator.bluetooth) {
-                    alert('您的浏览器不支持Web Bluetooth');
-                    return;
-                }
-
-                addLog('正在搜索ESP32-CAM设备...');
-                
-                device = await navigator.bluetooth.requestDevice({
-                    filters: [{ name: 'ESP32-CAM-BLE' }],
-                    optionalServices: [SERVICE_UUID]
-                });
-
-                device.addEventListener('gattserverdisconnected', onDisconnected);
-                
-                addLog(`找到设备: ${device.name}`);
-                deviceInfo.textContent = device.name || '未知设备';
-
-                addLog('正在连接...');
-                server = await device.gatt.connect();
-                service = await server.getPrimaryService(SERVICE_UUID);
-                
-                // 获取特征
-                imageChar = await service.getCharacteristic(IMAGE_CHAR_UUID);
-                controlChar = await service.getCharacteristic(CONTROL_CHAR_UUID);
-                
-                // 监听图像数据
-                await imageChar.startNotifications();
-                imageChar.addEventListener('characteristicvaluechanged', handleImageData);
-                
-                updateConnectionStatus(true);
-                addLog('连接成功！');
-
-            } catch (error) {
-                addLog('连接失败: ' + error);
-                console.error('Connection error:', error);
-            }
-        });
-
-        // 断开连接
-        disconnectBtn.addEventListener('click', () => {
-            if (server) {
-                server.disconnect();
-            }
-        });
-
-        // 断开连接处理
-        function onDisconnected() {
-            updateConnectionStatus(false);
-            deviceInfo.textContent = '';
-            addLog('设备已断开连接');
+        function resetTransferUI(){
+          progressBar.style.display = 'none';
+          progress.style.width = '0%';
+          imageInfo.textContent = '等待数据...';
         }
-
-        // 拍摄图片
-        captureBtn.addEventListener('click', async () => {
-            if (!controlChar) return;
-            
-            try {
-                addLog('发送拍摄命令...');
-                const command = new TextEncoder().encode('C');
-                await controlChar.writeValue(command);
-                addLog('拍摄命令已发送');
-            } catch (error) {
-                addLog('拍摄失败: ' + error);
-            }
-        });
-
-        // 分辨率设置
-        document.querySelectorAll('.resolution-buttons button').forEach(button => {
-            button.addEventListener('click', async () => {
-                if (!controlChar || !isConnected) return;
-                
-                const resolution = button.getAttribute('data-resolution');
-                try {
-                    addLog(`设置分辨率: ${resolution}`);
-                    const command = new TextEncoder().encode(resolution);
-                    await controlChar.writeValue(command);
-                    addLog('分辨率设置命令已发送');
-                } catch (error) {
-                    addLog('分辨率设置失败: ' + error);
-                }
+        function resetTransferState(){
+          expectedSize = 0;
+          receivedSize = 0;
+          totalSegs = 0;
+          expectSeq = 0;
+          transferId = 0;
+          imageBuffer = null;
+          receiving = false;
+          clearTimeout(timeoutTimer);
+          timeoutTimer = null;
+          resetTransferUI();
+        }
+        
+        function armTimeout(){
+          clearTimeout(timeoutTimer);
+          timeoutTimer = setTimeout(async ()=>{
+            if (!receiving) return;
+            addLog('超时：1.5s 无新数据，发送 RETRY');
+            try { await controlChar.writeValue(new TextEncoder().encode('RETRY')); } catch(e){}
+          }, 1500);
+        }
+        
+        async function connect(){
+          try{
+            if (!navigator.bluetooth) { alert('浏览器不支持 Web Bluetooth'); return; }
+            addLog('正在搜索设备...');
+            device = await navigator.bluetooth.requestDevice({
+              filters: [{ name: 'ESP32-CAM-BLE' }],
+              optionalServices: [SERVICE_UUID]
             });
+            device.addEventListener('gattserverdisconnected', onDisconnected);
+            deviceInfo.textContent = device.name || '未知设备';
+        
+            addLog('正在连接 GATT...');
+            server = await device.gatt.connect();
+            service = await server.getPrimaryService(SERVICE_UUID);
+            imageChar = await service.getCharacteristic(IMAGE_CHAR_UUID);
+            controlChar = await service.getCharacteristic(CONTROL_CHAR_UUID);
+        
+            await imageChar.startNotifications();
+            imageChar.addEventListener('characteristicvaluechanged', onImageData);
+        
+            setConn(true);
+            addLog('连接成功');
+          }catch(e){
+            addLog('连接失败: ' + e);
+            console.error(e);
+          }
+        }
+        function onDisconnected(){
+          setConn(false);
+          deviceInfo.textContent = '';
+          addLog('设备断开');
+          resetTransferState();
+        }
+        connectBtn.addEventListener('click', connect);
+        disconnectBtn.addEventListener('click', ()=>{ if(server) server.disconnect(); });
+        
+        captureBtn.addEventListener('click', async ()=>{
+          if(!controlChar) return;
+          try{
+            resetTransferState();
+            addLog('请求拍照 C...');
+            await controlChar.writeValue(new TextEncoder().encode('C'));
+          }catch(e){
+            addLog('发送失败: '+e);
+          }
         });
-
-        // 处理接收到的图像数据
-        function handleImageData(event) {
-            const value = event.target.value;
-            
-            if (value.byteLength === 0) return;
-
-            // 检查是否是文本命令（SIZE: 或 END）
-            if (value.byteLength < 20) { // 假设文本命令较短
-                const text = new TextDecoder().decode(value);
-                
-                if (text.startsWith('SIZE:')) {
-                    // 开始新图像传输
-                    expectedSize = parseInt(text.substring(5));
-                    receivedSize = 0;
-                    imageData = new Uint8Array(expectedSize);
-                    progressBar.style.display = 'block';
-                    progress.style.width = '0%';
-                    addLog(`开始接收图像，大小: ${expectedSize} 字节`);
-                    return;
-                } else if (text === 'END') {
-                    // 图像传输完成
-                    if (imageData && receivedSize === expectedSize) {
-                        displayImage(imageData);
-                        addLog(`图像接收完成: ${receivedSize} 字节`);
-                    }
-                    progressBar.style.display = 'none';
-                    imageData = null;
-                    return;
+        
+        // 分辨率
+        document.querySelectorAll('.resolution-buttons button').forEach(btn=>{
+          btn.addEventListener('click', async ()=>{
+            if(!controlChar || !isConnected) return;
+            try{
+              const code = btn.getAttribute('data-resolution');
+              addLog('设置分辨率 ' + code);
+              await controlChar.writeValue(new TextEncoder().encode(code));
+            }catch(e){
+              addLog('分辨率设置失败: '+e);
+            }
+          });
+        });
+        
+        // 数据处理
+        function onImageData(ev){
+          const dv = ev.target.value;
+          if (!dv || dv.byteLength === 0) return;
+        
+          // 尝试按文本解析
+          if (dv.byteLength <= 64) {
+            try{
+              const text = new TextDecoder().decode(dv);
+              if (text.startsWith('SIZE:')) {
+                // SIZE:<len>:ID:<id>
+                const m = text.match(/^SIZE:(\d+):ID:(\d+)/);
+                if (m) {
+                  expectedSize = parseInt(m[1]);
+                  transferId = parseInt(m[2]);
+                  imageBuffer = new Uint8Array(expectedSize);
+                  receivedSize = 0;
+                  expectSeq = 0;
+                  receiving = true;
+                  lastProgressTs = performance.now();
+                  progressBar.style.display = 'block';
+                  progress.style.width = '0%';
+                  addLog(`开始接收：len=${expectedSize}, id=${transferId}`);
+                  // 回 "GO"
+                  controlChar.writeValue(new TextEncoder().encode('GO')).catch(()=>{});
+                  armTimeout();
+                  return;
                 }
-            }
-
-            // 处理图像数据块
-            if (imageData && receivedSize < expectedSize) {
-                const chunk = new Uint8Array(value.buffer);
-                const remaining = expectedSize - receivedSize;
-                const chunkSize = Math.min(remaining, chunk.length);
-                
-                imageData.set(chunk.subarray(0, chunkSize), receivedSize);
-                receivedSize += chunkSize;
-                
-                // 更新进度条
-                const progressPercent = (receivedSize / expectedSize) * 100;
-                progress.style.width = progressPercent + '%';
-                
-                if (receivedSize % 5120 === 0) { // 每5KB记录一次
-                    addLog(`已接收: ${receivedSize}/${expectedSize} 字节 (${progressPercent.toFixed(1)}%)`);
+              }
+              if (text.startsWith('END:')) {
+                // END:<id>:<totalSegs>:<crc32>
+                const m = text.match(/^END:(\d+):(\d+):(\d+)$/);
+                if (m && receiving) {
+                  const id = parseInt(m[1]);
+                  const segs = parseInt(m[2]);
+                  const crc = parseInt(m[3]);
+                  if (id === transferId && segs === totalSegs && receivedSize === expectedSize) {
+                    // 简易 CRC32 校验（浏览器不自带，把长度校验作为第一道关）
+                    // 可选：你也可以在此引入纯 JS CRC32 校验
+                    showImage(imageBuffer);
+                    addLog(`接收完成: ${receivedSize} bytes`);
+                    receiving = false;
+                    clearTimeout(timeoutTimer);
+                    return;
+                  } else {
+                    addLog(`END 校验失败，触发 RETRY`);
+                    controlChar.writeValue(new TextEncoder().encode('RETRY')).catch(()=>{});
+                    return;
+                  }
                 }
-            }
+              }
+              if (text === 'ERROR') {
+                addLog('ESP32 错误');
+                receiving = false;
+                clearTimeout(timeoutTimer);
+                return;
+              }
+              if (text === 'OK') {
+                addLog('控制命令 OK');
+                return;
+              }
+            }catch{}
+          }
+        
+          // 二进制分片：2字节 seq + 数据
+          if (!receiving || !imageBuffer) {
+            addLog(`收到 ${dv.byteLength} 字节，但未处于接收状态`);
+            return;
+          }
+          armTimeout();
+        
+          const bytes = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+          if (bytes.length < 3) return;
+        
+          const seq = bytes[0] | (bytes[1] << 8);
+          const payload = bytes.subarray(2);
+        
+          // 初始化 totalSegs（仅在首包时根据长度估算，或递增 seq 计算）
+          if (seq === 0) {
+            totalSegs = Math.ceil(expectedSize / (payload.length));
+          }
+        
+          if (seq !== expectSeq) {
+            // 简化策略：发现乱序/缺包，直接 RETRY 整帧
+            addLog(`分片序号异常：期望 ${expectSeq} 实际 ${seq}，RETRY`);
+            controlChar.writeValue(new TextEncoder().encode('RETRY')).catch(()=>{});
+            return;
+          }
+        
+          // 拷贝到 buffer
+          const remain = expectedSize - receivedSize;
+          const copyLen = Math.min(remain, payload.length);
+          imageBuffer.set(payload.subarray(0, copyLen), receivedSize);
+          receivedSize += copyLen;
+          expectSeq++;
+        
+          // 进度
+          const pct = (receivedSize / expectedSize) * 100;
+          progress.style.width = pct + '%';
+          const now = performance.now();
+          if (now - lastProgressTs > 500) {
+            addLog(`进度：${receivedSize}/${expectedSize} (${pct.toFixed(1)}%)`);
+            lastProgressTs = now;
+          }
+        
+          if (receivedSize >= expectedSize) {
+            addLog('数据已接满，等待 END...');
+          }
         }
-
-        // 显示图像
-        function displayImage(data) {
-            try {
-                const blob = new Blob([data], { type: 'image/jpeg' });
-                const url = URL.createObjectURL(blob);
-                imageDisplay.src = url;
-                imageDisplay.style.display = 'block';
-                placeholder.style.display = 'none';
-                
-                imageInfo.textContent = `大小: ${data.length} 字节, 分辨率: 根据设置`;
-                addLog('图像显示成功');
-            } catch (error) {
-                addLog('图像显示失败: ' + error);
-            }
+        
+        function showImage(buf){
+          try{
+            const blob = new Blob([buf], {type:'image/jpeg'});
+            const url = URL.createObjectURL(blob);
+            imageDisplay.onload = ()=>URL.revokeObjectURL(url);
+            imageDisplay.onerror = ()=>URL.revokeObjectURL(url);
+            imageDisplay.src = url;
+            imageDisplay.style.display = 'block';
+            placeholder.style.display = 'none';
+            imageInfo.textContent = `大小: ${buf.length} 字节, 时间: ${new Date().toLocaleTimeString()}`;
+          }catch(e){
+            addLog('显示失败: '+e);
+          }
         }
-
-        // 初始化
-        addLog('页面加载完成，点击"连接设备"开始');
+        
+        // init
+        addLog('页面加载完成，点击“连接设备”开始');
+        addLog('建议使用 Chrome/Edge（支持 Web Bluetooth）');
     </script>
+
 </body>
 </html>
