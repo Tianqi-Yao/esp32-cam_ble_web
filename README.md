@@ -28,4 +28,4 @@
 1. 仓库 **Settings → Pages**  
 2. **Source** 选 `Deploy from a branch`，分支 `main`，目录 `/root`，保存  
 3. 等待部署完成，访问：  
-   `https://tianqi-yao.github.io/esp32_cam_ble_web/`
+   `https://tianqi-yao.github.io/esp32-cam_ble_web/`
